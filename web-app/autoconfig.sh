@@ -1,41 +1,39 @@
 #!/usr/bin/env bash
-# autoconfig-boot.sh — One-click Spring Boot (fat JAR) + optional Nginx reverse proxy
+# autoconfig-boot.sh — One-click Spring Boot fat JAR + Nginx (idempotent)
 set -euo pipefail
 
 GROUP_ID="com.example"
 ARTIFACT_ID="hello-boot"
 PACKAGE="com.example.demo"
-BOOT_VERSION="3.3.4"           # Safe to omit if needed
 JAVA_RELEASE="17"
 WORKDIR="${PWD}"
 PROJECT_DIR="${WORKDIR}/${ARTIFACT_ID}"
 SERVICE_NAME="${ARTIFACT_ID}.service"
 INSTALL_DIR="/opt/${ARTIFACT_ID}"
 JAR_PATH="${INSTALL_DIR}/app.jar"
-USE_NGINX="yes"                # set "no" to skip Nginx proxy
+USE_NGINX="yes"
 
 echo ">>> Installing base deps..."
 sudo apt-get update -y
 sudo apt-get install -y openjdk-17-jdk maven ca-certificates curl unzip
 
-# Choose port (avoid clash with Tomcat or anything on :8080)
+# Choose a free port (avoid Tomcat on 8080)
 BOOT_PORT=8080
 if systemctl is-active --quiet tomcat10 2>/dev/null || ss -ltn 2>/dev/null | grep -q ":8080 "; then
   BOOT_PORT=8081
 fi
 
-# Always regenerate the project
+# Clean slate
 rm -rf "${PROJECT_DIR}" "${INSTALL_DIR}"
 mkdir -p "${PROJECT_DIR}"
 cd "${WORKDIR}"
 
 echo ">>> Generating Spring Boot project (web)..."
 ZIP_OK=0
-# Try with explicit bootVersion first; if 400/err, retry without it
+# Try start.spring.io without strict bootVersion to avoid 400s
 if curl -fsSL -G "https://start.spring.io/starter.zip" \
   --data-urlencode "type=maven-project" \
   --data-urlencode "language=java" \
-  --data-urlencode "bootVersion=${BOOT_VERSION}" \
   --data-urlencode "baseDir=${ARTIFACT_ID}" \
   --data-urlencode "groupId=${GROUP_ID}" \
   --data-urlencode "artifactId=${ARTIFACT_ID}" \
@@ -43,19 +41,6 @@ if curl -fsSL -G "https://start.spring.io/starter.zip" \
   --data-urlencode "packageName=${PACKAGE}" \
   --data-urlencode "dependencies=web" -o boot.zip; then
   ZIP_OK=1
-else
-  echo ">>> start.spring.io rejected bootVersion; retrying without bootVersion..."
-  if curl -fsSL -G "https://start.spring.io/starter.zip" \
-    --data-urlencode "type=maven-project" \
-    --data-urlencode "language=java" \
-    --data-urlencode "baseDir=${ARTIFACT_ID}" \
-    --data-urlencode "groupId=${GROUP_ID}" \
-    --data-urlencode "artifactId=${ARTIFACT_ID}" \
-    --data-urlencode "name=${ARTIFACT_ID}" \
-    --data-urlencode "packageName=${PACKAGE}" \
-    --data-urlencode "dependencies=web" -o boot.zip; then
-    ZIP_OK=1
-  fi
 fi
 
 if [ "${ZIP_OK}" -eq 1 ]; then
@@ -66,6 +51,8 @@ else
   mkdir -p "${PROJECT_DIR}/src/main/java/${PACKAGE//./\/}" \
            "${PROJECT_DIR}/src/test/java/${PACKAGE//./\/}" \
            "${PROJECT_DIR}/src/main/resources"
+
+  # Minimal Boot pom
   cat > "${PROJECT_DIR}/pom.xml" <<'POM'
 <project xmlns="http://maven.apache.org/POM/4.0.0"
   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -115,16 +102,36 @@ POM
 package ${PACKAGE};
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
-import org.springframework.web.bind.annotation.*;
 @SpringBootApplication
-@RestController
 public class DemoApplication {
-  @GetMapping("/")
-  public String home() { return "It works! 🎉 (Spring Boot)"; }
   public static void main(String[] args) { SpringApplication.run(DemoApplication.class, args); }
 }
 JAVA
 fi
+
+# Ensure we ALWAYS have a root controller + health endpoint
+mkdir -p "${PROJECT_DIR}/src/main/java/${PACKAGE//./\/}" "${PROJECT_DIR}/src/main/resources"
+cat > "${PROJECT_DIR}/src/main/java/${PACKAGE//./\/}/HelloController.java" <<JAVA
+package ${PACKAGE};
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+@RestController
+public class HelloController {
+  @GetMapping("/")
+  public String root() { return "It works! 🎉 (Spring Boot)"; }
+
+  @GetMapping("/healthz")
+  public String health() { return "ok"; }
+}
+JAVA
+
+# Pin port and basic proxy headers
+cat > "${PROJECT_DIR}/src/main/resources/application.properties" <<PROPS
+server.port=${BOOT_PORT}
+server.forward-headers-strategy=framework
+management.endpoints.web.exposure.include=health,info
+PROPS
 
 cd "${PROJECT_DIR}"
 
@@ -134,13 +141,10 @@ mvn -q -DskipTests package
 echo ">>> Installing app to ${INSTALL_DIR}..."
 sudo mkdir -p "${INSTALL_DIR}"
 JAR_BUILT="$(find target -maxdepth 1 -type f -name "*.jar" ! -name "*sources.jar" | head -n1)"
-if [ -z "${JAR_BUILT}" ]; then
-  echo "ERROR: No JAR produced under target/. Check Maven output."
-  exit 1
-fi
+[ -n "${JAR_BUILT}" ] || { echo "ERROR: No JAR produced under target/"; exit 1; }
 sudo cp -f "${JAR_BUILT}" "${JAR_PATH}"
 
-# systemd service
+# systemd service (binds to BOOT_PORT, logs to journal)
 sudo bash -c "cat > /etc/systemd/system/${SERVICE_NAME}" <<EOF
 [Unit]
 Description=${ARTIFACT_ID} Spring Boot
@@ -149,7 +153,7 @@ After=network-online.target
 
 [Service]
 User=root
-ExecStart=/usr/bin/java -jar ${JAR_PATH} --server.port=${BOOT_PORT}
+ExecStart=/usr/bin/java -jar ${JAR_PATH}
 Restart=always
 RestartSec=2
 Environment=JAVA_TOOL_OPTIONS=-XX:+UseZGC
@@ -164,12 +168,26 @@ sudo systemctl daemon-reload
 sudo systemctl enable "${SERVICE_NAME}"
 sudo systemctl restart "${SERVICE_NAME}"
 
+# Wait until the app is ready
+echo ">>> Waiting for app on :${BOOT_PORT} ..."
+for i in {1..30}; do
+  if curl -fsS "http://127.0.0.1:${BOOT_PORT}/healthz" >/dev/null 2>&1; then
+    echo "App is up."
+    break
+  fi
+  sleep 1
+  if [ $i -eq 30 ]; then
+    echo "App did not become ready in time. Recent logs:"
+    sudo journalctl -u "${SERVICE_NAME}" -n 80 --no-pager || true
+    exit 1
+  fi
+done
+
 APP_URL="http://localhost:${BOOT_PORT}/"
 
 if [ "${USE_NGINX}" = "yes" ]; then
   echo ">>> Installing & configuring Nginx reverse proxy..."
   sudo apt-get install -y nginx
-  # remove the default site to avoid "duplicate default server"
   sudo rm -f /etc/nginx/sites-enabled/default
 
   sudo bash -c "cat > /etc/nginx/sites-available/${ARTIFACT_ID}" <<NGX
@@ -179,10 +197,13 @@ server {
   server_name _;
   location / {
     proxy_pass http://127.0.0.1:${BOOT_PORT};
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
     proxy_set_header Host \$host;
     proxy_set_header X-Real-IP \$remote_addr;
     proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto \$scheme;
+    proxy_read_timeout 60s;
   }
 }
 NGX
@@ -192,14 +213,13 @@ NGX
   APP_URL="http://localhost/"
 fi
 
-# quick probe
-if command -v curl >/dev/null; then
-  echo ">>> Probing ${APP_URL} ..."
-  curl -fsS "${APP_URL}" >/dev/null && echo "OK" || echo "Probe failed (firewall or service starting up?)"
-fi
+# Final probe
+echo ">>> Probing ${APP_URL} ..."
+curl -fsS "${APP_URL}" >/dev/null && echo "OK" || echo "Probe failed (but app is up on :${BOOT_PORT})"
 
 echo "------------------------------------------------------------"
 echo "Boot URL   : ${APP_URL}"
+echo "Direct URL : http://$(hostname -I | awk '{print $1}'):${BOOT_PORT}/"
 echo "Project    : ${PROJECT_DIR}"
 echo "Service    : ${SERVICE_NAME}"
 echo "Jar        : ${JAR_PATH}"
