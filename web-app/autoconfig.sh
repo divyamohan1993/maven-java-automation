@@ -73,6 +73,40 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
 command -v ss >/dev/null 2>&1 || sudo apt-get install -y iproute2 >/dev/null 2>&1 || true
 command -v sha256sum >/dev/null 2>&1 || sudo apt-get install -y coreutils >/dev/null 2>&1 || true
 
+# --- NEVER BREAK SSH (GCE-safe) ---
+# 1) Ensure OpenSSH is present and running (don’t restart if already up)
+sudo apt-get install -y openssh-server
+sudo systemctl enable ssh >/dev/null 2>&1 || true
+sudo systemctl start  ssh >/dev/null 2>&1 || true
+
+# 2) If UFW exists, guarantee 22/tcp stays open without changing overall policy
+if command -v ufw >/dev/null 2>&1; then
+  # Allow port 22 generally…
+  sudo ufw allow 22/tcp >/dev/null 2>&1 || true
+  # …and explicitly allow your current client IP if we can detect it
+  REMOTE_IP="$(printf '%s' "${SSH_CONNECTION:-}" | awk '{print $1}')"
+  if [ -n "$REMOTE_IP" ]; then
+    sudo ufw allow from "$REMOTE_IP" to any port 22 proto tcp >/dev/null 2>&1 || true
+  fi
+  # DO NOT enable or reload UFW here; we never call `ufw enable`.
+fi
+
+# 3) If nftables is in use and default-drop rules exist, add a permissive 22/tcp rule (no reload)
+if command -v nft >/dev/null 2>&1; then
+  # Add only if the allow isn’t already present
+  if ! sudo nft list ruleset 2>/dev/null | grep -q 'tcp dport 22 accept'; then
+    sudo nft add rule inet filter input tcp dport 22 ct state new,established accept >/dev/null 2>&1 || true
+  fi
+fi
+
+# 4) Sanity check: confirm something is listening on :22
+if ! ss -ltn 2>/dev/null | grep -q ':22 '; then
+  echo "!!! Warning: nothing is listening on port 22; attempting to (re)start sshd"
+  sudo systemctl start ssh || true
+fi
+
+
+
 # --------------- Users & dirs ---------------
 if ! id "$APP_NAME" >/dev/null 2>&1; then
   sudo useradd -r -m -U -d "$INSTALL_DIR" -s /usr/sbin/nologin "$APP_NAME"
