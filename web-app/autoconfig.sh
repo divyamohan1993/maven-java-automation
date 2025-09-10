@@ -97,8 +97,7 @@ cd "$PROJECT_DIR"
 # --- POM for Tomcat 10+ (jakarta.*) ---
 cat > pom.xml <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
   <groupId>${GROUP_ID}</groupId>
@@ -112,21 +111,25 @@ cat > pom.xml <<EOF
   </properties>
 
   <dependencies>
+    <!-- Tomcat 10.1 implements Servlet 6.0 -->
     <dependency>
       <groupId>jakarta.servlet</groupId>
       <artifactId>jakarta.servlet-api</artifactId>
-      <version>5.0.0</version>
+      <version>6.0.0</version>
       <scope>provided</scope>
     </dependency>
   </dependencies>
 
   <build>
+    <!-- Force final file name to hello-web.war -->
+    <finalName>${artifactId}</finalName>
+
     <plugins>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
         <version>3.11.0</version>
-        <configuration><release>\${maven.compiler.release}</release></configuration>
+        <configuration><release>${maven.compiler.release}</release></configuration>
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
@@ -151,12 +154,29 @@ fi
 # --- build & deploy ---
 echo ">>> Building WAR..."
 mvn -q clean package
-WAR="target/${ARTIFACT_ID}.war"
-[ -f "$WAR" ] || { echo "Build failed: WAR not found"; exit 1; }
+
+# Accept hello-web.war (finalName) OR hello-web-<version>.war
+WAR=""
+if [ -f "target/${ARTIFACT_ID}.war" ]; then
+  WAR="target/${ARTIFACT_ID}.war"
+elif [ -f "target/${ARTIFACT_ID}-${VERSION}.war" ]; then
+  WAR="target/${ARTIFACT_ID}-${VERSION}.war"
+else
+  # fallback to first .war found
+  WAR="$(ls -1 target/*.war 2>/dev/null | head -n1 || true)"
+fi
+
+[ -n "$WAR" ] && [ -f "$WAR" ] || { echo "Build failed: WAR not found in target/"; exit 1; }
 
 WEBAPPS_DIR="${TOMCAT_HOME:-/var/lib/${TOMCAT_SVC}}/webapps"
-echo ">>> Deploying to ${WEBAPPS_DIR}..."
+echo ">>> Deploying ${WAR} to ${WEBAPPS_DIR}..."
 sudo cp -f "$WAR" "$WEBAPPS_DIR/"
+
+if command -v journalctl >/dev/null; then
+  echo ">>> Recent Tomcat logs:"
+  sudo journalctl -u "${TOMCAT_SVC}" -n 50 --no-pager || true
+fi
+
 
 # --- start/restart ---
 if command -v systemctl >/dev/null; then
