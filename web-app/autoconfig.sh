@@ -225,3 +225,4 @@ echo "Service    : ${SERVICE_NAME}"
 echo "Jar        : ${JAR_PATH}"
 echo "Port       : ${BOOT_PORT}"
 echo "------------------------------------------------------------"
+
