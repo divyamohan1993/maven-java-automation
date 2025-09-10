@@ -1,186 +1,153 @@
 #!/usr/bin/env bash
-# autoconfig.sh — one-click Maven webapp -> Tomcat 10 (Ubuntu/Debian incl. 25.04)
+# autoconfig-boot.sh — One-click Spring Boot (fat JAR) + optional Nginx reverse proxy
 set -euo pipefail
 
 GROUP_ID="com.example"
-ARTIFACT_ID="hello-web"
-VERSION="1.0.0"
+ARTIFACT_ID="hello-boot"
+PACKAGE="com.example.demo"
+BOOT_VERSION="3.3.4"           # Spring Boot
 JAVA_RELEASE="17"
-ARCHETYPE_VERSION="1.4"
 WORKDIR="${PWD}"
 PROJECT_DIR="${WORKDIR}/${ARTIFACT_ID}"
+SERVICE_NAME="${ARTIFACT_ID}.service"
+INSTALL_DIR="/opt/${ARTIFACT_ID}"
+JAR_PATH="${INSTALL_DIR}/app.jar"
+USE_NGINX="yes"                # set to "no" to skip Nginx proxy
 
-echo ">>> Starting one-click Maven webapp setup..."
-
-# --- base deps ---
-if ! command -v apt-get >/dev/null; then echo "Needs Debian/Ubuntu (apt-get)"; exit 1; fi
+echo ">>> Installing base deps..."
 sudo apt-get update -y
-sudo apt-get install -y openjdk-17-jdk maven ca-certificates curl wget
+sudo apt-get install -y openjdk-17-jdk maven ca-certificates curl unzip
 
-# --- helper: apt candidate value ---
-apt_candidate() { apt-cache policy "$1" 2>/dev/null | awk -F': ' '/Candidate:/ {print $2}'; }
+# Always regenerate the project
+rm -rf "${PROJECT_DIR}" "${INSTALL_DIR}"
+mkdir -p "${PROJECT_DIR}"
+cd "${WORKDIR}"
 
-# --- Tomcat 10 install (pkg preferred; manual fallback) ---
-TOMCAT_SVC=""
-TOMCAT_HOME=""
-cand10="$(apt_candidate tomcat10 || true)"
-if [ -n "${cand10:-}" ] && [ "$cand10" != "(none)" ]; then
-  echo ">>> Installing Tomcat 10 from package repo (candidate: $cand10)..."
-  sudo apt-get install -y tomcat10
-  TOMCAT_SVC="tomcat10"
-  TOMCAT_HOME="/var/lib/tomcat10"
+echo ">>> Generating Spring Boot project (web)..."
+if curl -fsSL "https://start.spring.io/starter.zip?type=maven-project&language=java&bootVersion=${BOOT_VERSION}&baseDir=${ARTIFACT_ID}&groupId=${GROUP_ID}&artifactId=${ARTIFACT_ID}&name=${ARTIFACT_ID}&packageName=${PACKAGE}&dependencies=web" -o boot.zip ; then
+  unzip -q boot.zip -d "${WORKDIR}"
+  rm -f boot.zip
 else
-  echo ">>> tomcat10 pkg not available. Installing Tomcat 10.1 manually..."
-  TOMCAT_VERSION="10.1.24"
-  TOMCAT_HOME="/opt/tomcat"
-  TOMCAT_SVC="tomcat10"
-
-  if ! id tomcat &>/dev/null; then
-    sudo useradd -r -m -U -d /opt/tomcat -s /usr/sbin/nologin tomcat
-  fi
-  sudo mkdir -p "$TOMCAT_HOME"
-  cd /tmp
-  if [ ! -f "apache-tomcat-${TOMCAT_VERSION}.tar.gz" ]; then
-    wget -q "https://archive.apache.org/dist/tomcat/tomcat-10/v${TOMCAT_VERSION}/bin/apache-tomcat-${TOMCAT_VERSION}.tar.gz"
-  fi
-  sudo tar -xzf "apache-tomcat-${TOMCAT_VERSION}.tar.gz" -C "$TOMCAT_HOME" --strip-components=1
-  sudo chown -R tomcat:tomcat "$TOMCAT_HOME"
-  sudo chmod +x "$TOMCAT_HOME/bin/"*.sh
-
-  sudo tee /etc/systemd/system/tomcat10.service >/dev/null <<EOF
-[Unit]
-Description=Apache Tomcat 10
-After=network.target
-
-[Service]
-Type=forking
-User=tomcat
-Group=tomcat
-Environment=JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
-Environment=CATALINA_HOME=${TOMCAT_HOME}
-Environment=CATALINA_BASE=${TOMCAT_HOME}
-Environment=CATALINA_PID=${TOMCAT_HOME}/temp/tomcat.pid
-Environment=CATALINA_OPTS=-Xms256M -Xmx512M
-ExecStart=${TOMCAT_HOME}/bin/startup.sh
-ExecStop=${TOMCAT_HOME}/bin/shutdown.sh
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  sudo systemctl daemon-reload
-  sudo systemctl enable tomcat10
-fi
-
-# --- FORCE (re)generate: backup existing dir, then generate fresh ---
-if [ -d "$PROJECT_DIR" ]; then
-  ts="$(date +%Y%m%d_%H%M%S)"
-  echo ">>> Project exists; backing up to ${PROJECT_DIR}.bak-${ts} and regenerating..."
-  mv "$PROJECT_DIR" "${PROJECT_DIR}.bak-${ts}"
-fi
-
-echo ">>> Generating Maven webapp project: $ARTIFACT_ID"
-mvn -B archetype:generate \
-  -DgroupId="$GROUP_ID" \
-  -DartifactId="$ARTIFACT_ID" \
-  -DarchetypeArtifactId=maven-archetype-webapp \
-  -DarchetypeVersion="$ARCHETYPE_VERSION" \
-  -DinteractiveMode=false
-
-cd "$PROJECT_DIR"
-
-# --- POM for Tomcat 10+ (Jakarta Servlet 6); fix finalName escaping ---
-cat > pom.xml <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
+  echo ">>> start.spring.io unreachable — falling back to local scaffold"
+  mkdir -p "${PROJECT_DIR}/src/main/java/${PACKAGE//./\/}" "${PROJECT_DIR}/src/test/java/${PACKAGE//./\/}" "${PROJECT_DIR}/src/main/resources"
+  cat > "${PROJECT_DIR}/pom.xml" <<'POM'
 <project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+  xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
-  <groupId>${GROUP_ID}</groupId>
-  <artifactId>${ARTIFACT_ID}</artifactId>
-  <version>${VERSION}</version>
-  <packaging>war</packaging>
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.3.4</version>
+    <relativePath/>
+  </parent>
 
+  <groupId>__GROUP_ID__</groupId>
+  <artifactId>__ARTIFACT_ID__</artifactId>
+  <version>1.0.0</version>
+  <name>__ARTIFACT_ID__</name>
+  <description>Spring Boot app</description>
   <properties>
-    <maven.compiler.release>${JAVA_RELEASE}</maven.compiler.release>
-    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <java.version>__JAVA_RELEASE__</java.version>
   </properties>
 
   <dependencies>
-    <!-- Tomcat 10.1 implements Jakarta Servlet 6.0 -->
     <dependency>
-      <groupId>jakarta.servlet</groupId>
-      <artifactId>jakarta.servlet-api</artifactId>
-      <version>6.0.0</version>
-      <scope>provided</scope>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
     </dependency>
   </dependencies>
 
   <build>
-    <!-- keep WAR name equal to artifactId -->
-    <finalName>\${project.artifactId}</finalName>
-
     <plugins>
       <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-compiler-plugin</artifactId>
-        <version>3.11.0</version>
-        <configuration><release>\${maven.compiler.release}</release></configuration>
-      </plugin>
-      <plugin>
-        <groupId>org.apache.maven.plugins</groupId>
-        <artifactId>maven-war-plugin</artifactId>
-        <version>3.4.0</version>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-maven-plugin</artifactId>
       </plugin>
     </plugins>
   </build>
 </project>
+POM
+  sed -i "s|__GROUP_ID__|$GROUP_ID|g; s|__ARTIFACT_ID__|$ARTIFACT_ID|g; s|__JAVA_RELEASE__|$JAVA_RELEASE|g" "${PROJECT_DIR}/pom.xml"
+
+  cat > "${PROJECT_DIR}/src/main/java/${PACKAGE//./\/}/DemoApplication.java" <<JAVA
+package ${PACKAGE};
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.web.bind.annotation.*;
+@SpringBootApplication
+@RestController
+public class DemoApplication {
+  @GetMapping("/")
+  public String home() { return "It works! \uD83C\uDF89 (Spring Boot)"; }
+  public static void main(String[] args) { SpringApplication.run(DemoApplication.class, args); }
+}
+JAVA
+fi
+
+cd "${PROJECT_DIR}"
+
+echo ">>> Building fat JAR..."
+./mvnw -q -DskipTests package || mvn -q -DskipTests package
+
+echo ">>> Installing app to ${INSTALL_DIR}..."
+sudo mkdir -p "${INSTALL_DIR}"
+JAR_BUILT="$(ls -1 target/*.jar | grep -v sources.jar | head -n1)"
+sudo cp -f "${JAR_BUILT}" "${JAR_PATH}"
+sudo bash -c "cat > /etc/systemd/system/${SERVICE_NAME}" <<EOF
+[Unit]
+Description=${ARTIFACT_ID} Spring Boot
+After=network.target
+
+[Service]
+User=root
+ExecStart=/usr/bin/java -jar ${JAR_PATH}
+Restart=always
+RestartSec=2
+Environment=JAVA_TOOL_OPTIONS=-XX:+UseZGC
+WorkingDirectory=${INSTALL_DIR}
+
+[Install]
+WantedBy=multi-user.target
 EOF
 
-# --- minimal index.jsp (idempotent fresh tree already) ---
-mkdir -p src/main/webapp
-cat > src/main/webapp/index.jsp <<'JSP'
-<%@ page contentType="text/html; charset=UTF-8" %>
-<!DOCTYPE html><html><head><meta charset="utf-8"><title>Hello Web</title></head>
-<body><h1>It works! 🎉</h1><p>Deployed via autoconfig.sh</p></body></html>
-JSP
+echo ">>> Enabling & starting service..."
+sudo systemctl daemon-reload
+sudo systemctl enable "${SERVICE_NAME}"
+sudo systemctl restart "${SERVICE_NAME}"
 
-# --- build & deploy ---
-echo ">>> Building WAR..."
-mvn -q clean package
+APP_URL="http://localhost:8080/"
 
-# Accept hello-web.war (finalName) OR hello-web-<version>.war OR any .war
-WAR=""
-if [ -f "target/${ARTIFACT_ID}.war" ]; then
-  WAR="target/${ARTIFACT_ID}.war"
-elif [ -f "target/${ARTIFACT_ID}-${VERSION}.war" ]; then
-  WAR="target/${ARTIFACT_ID}-${VERSION}.war"
-else
-  WAR="$(ls -1 target/*.war 2>/dev/null | head -n1 || true)"
-fi
-[ -n "$WAR" ] && [ -f "$WAR" ] || { echo "Build failed: WAR not found in target/"; exit 1; }
-
-WEBAPPS_DIR="${TOMCAT_HOME:-/var/lib/${TOMCAT_SVC}}/webapps"
-echo ">>> Deploying ${WAR} to ${WEBAPPS_DIR}..."
-sudo cp -f "$WAR" "$WEBAPPS_DIR/"
-
-# --- restart & quick health check ---
-echo ">>> Restarting ${TOMCAT_SVC}..."
-if command -v systemctl >/dev/null; then
-  sudo systemctl restart "${TOMCAT_SVC}"
-  sleep 2
-  sudo systemctl --no-pager --full status "${TOMCAT_SVC}" | sed -n '1,15p' || true
-fi
-
-if command -v curl >/dev/null; then
-  echo ">>> Probing http://localhost:8080/${ARTIFACT_ID}/ ..."
-  curl -fsS "http://localhost:8080/${ARTIFACT_ID}/" >/dev/null && echo "OK" || echo "Probe failed (open 8080 on firewall?)."
+if [ "${USE_NGINX}" = "yes" ]; then
+  echo ">>> Installing & configuring Nginx reverse proxy..."
+  sudo apt-get install -y nginx
+  sudo bash -c 'cat > /etc/nginx/sites-available/hello-boot <<NGX
+server {
+  listen 80 default_server;
+  listen [::]:80 default_server;
+  server_name _;
+  location / {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+  }
+}
+NGX'
+  sudo ln -sf /etc/nginx/sites-available/hello-boot /etc/nginx/sites-enabled/hello-boot
+  sudo nginx -t && sudo systemctl restart nginx
+  APP_URL="http://localhost/"
 fi
 
 echo "------------------------------------------------------------"
-echo "URL         : http://localhost:8080/${ARTIFACT_ID}/"
-echo "Project dir : $PROJECT_DIR"
-echo "Tomcat home : ${TOMCAT_HOME:-/var/lib/${TOMCAT_SVC}}"
-echo "WAR         : $WAR"
+echo "Boot URL   : ${APP_URL}"
+echo "Project    : ${PROJECT_DIR}"
+echo "Service    : ${SERVICE_NAME}"
+echo "Jar        : ${JAR_PATH}"
 echo "------------------------------------------------------------"
