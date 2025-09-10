@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# autoconfig.sh — one-click Maven webapp to Tomcat (Ubuntu/Debian)
+# autoconfig.sh — one-click Maven webapp -> Tomcat (Ubuntu/Debian, incl. 25.04)
 set -euo pipefail
 
 GROUP_ID="com.example"
@@ -16,22 +16,28 @@ if ! command -v apt-get >/dev/null; then echo "Needs Debian/Ubuntu (apt-get)"; e
 sudo apt-get update -y
 sudo apt-get install -y openjdk-17-jdk maven ca-certificates curl wget
 
-# --- Tomcat install (pkg -> manual fallback) ---
+# --- helper to fetch apt candidate value ('' or (none) means unavailable) ---
+apt_candidate() {
+  apt-cache policy "$1" 2>/dev/null | awk -F': ' '/Candidate:/ {print $2}'
+}
+
+# --- Tomcat install: prefer package tomcat10, else manual 10.1 ---
 TOMCAT_SVC=""
 TOMCAT_HOME=""
 
-if apt-cache policy tomcat10 | grep -q Candidate; then
-  echo ">>> Installing Tomcat 10 from package repo..."
+cand10="$(apt_candidate tomcat10 || true)"
+if [ -n "${cand10:-}" ] && [ "$cand10" != "(none)" ]; then
+  echo ">>> Installing Tomcat 10 from package repo (candidate: $cand10)..."
   sudo apt-get install -y tomcat10
   TOMCAT_SVC="tomcat10"
   TOMCAT_HOME="/var/lib/tomcat10"
 else
-  echo ">>> tomcat10 package not found. Installing Tomcat 10.1 manually..."
+  echo ">>> tomcat10 package not available. Installing Tomcat 10.1 manually..."
   TOMCAT_VERSION="10.1.24"
   TOMCAT_HOME="/opt/tomcat"
   TOMCAT_SVC="tomcat10"
 
-  # non-login service user
+  # service user
   if ! id tomcat &>/dev/null; then
     sudo useradd -r -m -U -d /opt/tomcat -s /usr/sbin/nologin tomcat
   fi
@@ -73,7 +79,7 @@ EOF
   sudo systemctl enable tomcat10
 fi
 
-# --- generate webapp ---
+# --- generate maven webapp (idempotent) ---
 if [ ! -d "$PROJECT_DIR" ]; then
   echo ">>> Generating Maven webapp project: $ARTIFACT_ID"
   mvn archetype:generate \
@@ -88,7 +94,7 @@ fi
 
 cd "$PROJECT_DIR"
 
-# --- POM (Jakarta for Tomcat 10) ---
+# --- POM for Tomcat 10+ (jakarta.*) ---
 cat > pom.xml <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0"
@@ -106,7 +112,6 @@ cat > pom.xml <<EOF
   </properties>
 
   <dependencies>
-    <!-- Tomcat 10+ uses jakarta.* -->
     <dependency>
       <groupId>jakarta.servlet</groupId>
       <artifactId>jakarta.servlet-api</artifactId>
@@ -143,19 +148,13 @@ if [ ! -f src/main/webapp/index.jsp ]; then
 JSP
 fi
 
-# --- build ---
+# --- build & deploy ---
 echo ">>> Building WAR..."
 mvn -q clean package
 WAR="target/${ARTIFACT_ID}.war"
 [ -f "$WAR" ] || { echo "Build failed: WAR not found"; exit 1; }
 
-# --- deploy ---
-if [ -z "$TOMCAT_HOME" ]; then
-  # package install path
-  WEBAPPS_DIR="/var/lib/${TOMCAT_SVC}/webapps"
-else
-  WEBAPPS_DIR="${TOMCAT_HOME}/webapps"
-fi
+WEBAPPS_DIR="${TOMCAT_HOME:-/var/lib/${TOMCAT_SVC}}/webapps"
 echo ">>> Deploying to ${WEBAPPS_DIR}..."
 sudo cp -f "$WAR" "$WEBAPPS_DIR/"
 
