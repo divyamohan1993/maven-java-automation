@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# autoconfig.sh — one-click Maven webapp -> Tomcat (Ubuntu/Debian, incl. 25.04)
+# autoconfig.sh — one-click Maven webapp -> Tomcat 10 (Ubuntu/Debian incl. 25.04)
 set -euo pipefail
 
 GROUP_ID="com.example"
@@ -7,7 +7,8 @@ ARTIFACT_ID="hello-web"
 VERSION="1.0.0"
 JAVA_RELEASE="17"
 ARCHETYPE_VERSION="1.4"
-PROJECT_DIR="$PWD/$ARTIFACT_ID"
+WORKDIR="${PWD}"
+PROJECT_DIR="${WORKDIR}/${ARTIFACT_ID}"
 
 echo ">>> Starting one-click Maven webapp setup..."
 
@@ -16,15 +17,12 @@ if ! command -v apt-get >/dev/null; then echo "Needs Debian/Ubuntu (apt-get)"; e
 sudo apt-get update -y
 sudo apt-get install -y openjdk-17-jdk maven ca-certificates curl wget
 
-# --- helper to fetch apt candidate value ('' or (none) means unavailable) ---
-apt_candidate() {
-  apt-cache policy "$1" 2>/dev/null | awk -F': ' '/Candidate:/ {print $2}'
-}
+# --- helper: apt candidate value ---
+apt_candidate() { apt-cache policy "$1" 2>/dev/null | awk -F': ' '/Candidate:/ {print $2}'; }
 
-# --- Tomcat install: prefer package tomcat10, else manual 10.1 ---
+# --- Tomcat 10 install (pkg preferred; manual fallback) ---
 TOMCAT_SVC=""
 TOMCAT_HOME=""
-
 cand10="$(apt_candidate tomcat10 || true)"
 if [ -n "${cand10:-}" ] && [ "$cand10" != "(none)" ]; then
   echo ">>> Installing Tomcat 10 from package repo (candidate: $cand10)..."
@@ -32,16 +30,14 @@ if [ -n "${cand10:-}" ] && [ "$cand10" != "(none)" ]; then
   TOMCAT_SVC="tomcat10"
   TOMCAT_HOME="/var/lib/tomcat10"
 else
-  echo ">>> tomcat10 package not available. Installing Tomcat 10.1 manually..."
+  echo ">>> tomcat10 pkg not available. Installing Tomcat 10.1 manually..."
   TOMCAT_VERSION="10.1.24"
   TOMCAT_HOME="/opt/tomcat"
   TOMCAT_SVC="tomcat10"
 
-  # service user
   if ! id tomcat &>/dev/null; then
     sudo useradd -r -m -U -d /opt/tomcat -s /usr/sbin/nologin tomcat
   fi
-
   sudo mkdir -p "$TOMCAT_HOME"
   cd /tmp
   if [ ! -f "apache-tomcat-${TOMCAT_VERSION}.tar.gz" ]; then
@@ -51,7 +47,6 @@ else
   sudo chown -R tomcat:tomcat "$TOMCAT_HOME"
   sudo chmod +x "$TOMCAT_HOME/bin/"*.sh
 
-  # systemd unit
   sudo tee /etc/systemd/system/tomcat10.service >/dev/null <<EOF
 [Unit]
 Description=Apache Tomcat 10
@@ -74,30 +69,32 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-
   sudo systemctl daemon-reload
   sudo systemctl enable tomcat10
 fi
 
-# --- generate maven webapp (idempotent) ---
-if [ ! -d "$PROJECT_DIR" ]; then
-  echo ">>> Generating Maven webapp project: $ARTIFACT_ID"
-  mvn archetype:generate \
-    -DgroupId="$GROUP_ID" \
-    -DartifactId="$ARTIFACT_ID" \
-    -DarchetypeArtifactId=maven-archetype-webapp \
-    -DarchetypeVersion="$ARCHETYPE_VERSION" \
-    -DinteractiveMode=false
-else
-  echo ">>> Project exists at $PROJECT_DIR (skip generate)"
+# --- FORCE (re)generate: backup existing dir, then generate fresh ---
+if [ -d "$PROJECT_DIR" ]; then
+  ts="$(date +%Y%m%d_%H%M%S)"
+  echo ">>> Project exists; backing up to ${PROJECT_DIR}.bak-${ts} and regenerating..."
+  mv "$PROJECT_DIR" "${PROJECT_DIR}.bak-${ts}"
 fi
+
+echo ">>> Generating Maven webapp project: $ARTIFACT_ID"
+mvn -B archetype:generate \
+  -DgroupId="$GROUP_ID" \
+  -DartifactId="$ARTIFACT_ID" \
+  -DarchetypeArtifactId=maven-archetype-webapp \
+  -DarchetypeVersion="$ARCHETYPE_VERSION" \
+  -DinteractiveMode=false
 
 cd "$PROJECT_DIR"
 
-# --- POM for Tomcat 10+ (jakarta.*) ---
+# --- POM for Tomcat 10+ (Jakarta Servlet 6); fix finalName escaping ---
 cat > pom.xml <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
-<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
   <groupId>${GROUP_ID}</groupId>
@@ -111,7 +108,7 @@ cat > pom.xml <<EOF
   </properties>
 
   <dependencies>
-    <!-- Tomcat 10.1 implements Servlet 6.0 -->
+    <!-- Tomcat 10.1 implements Jakarta Servlet 6.0 -->
     <dependency>
       <groupId>jakarta.servlet</groupId>
       <artifactId>jakarta.servlet-api</artifactId>
@@ -121,15 +118,15 @@ cat > pom.xml <<EOF
   </dependencies>
 
   <build>
-    <!-- Force final file name to hello-web.war -->
-    <finalName>${artifactId}</finalName>
+    <!-- keep WAR name equal to artifactId -->
+    <finalName>\${project.artifactId}</finalName>
 
     <plugins>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
         <version>3.11.0</version>
-        <configuration><release>${maven.compiler.release}</release></configuration>
+        <configuration><release>\${maven.compiler.release}</release></configuration>
       </plugin>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
@@ -141,50 +138,44 @@ cat > pom.xml <<EOF
 </project>
 EOF
 
-# minimal index.jsp
+# --- minimal index.jsp (idempotent fresh tree already) ---
 mkdir -p src/main/webapp
-if [ ! -f src/main/webapp/index.jsp ]; then
-  cat > src/main/webapp/index.jsp <<'JSP'
+cat > src/main/webapp/index.jsp <<'JSP'
 <%@ page contentType="text/html; charset=UTF-8" %>
 <!DOCTYPE html><html><head><meta charset="utf-8"><title>Hello Web</title></head>
 <body><h1>It works! 🎉</h1><p>Deployed via autoconfig.sh</p></body></html>
 JSP
-fi
 
 # --- build & deploy ---
 echo ">>> Building WAR..."
 mvn -q clean package
 
-# Accept hello-web.war (finalName) OR hello-web-<version>.war
+# Accept hello-web.war (finalName) OR hello-web-<version>.war OR any .war
 WAR=""
 if [ -f "target/${ARTIFACT_ID}.war" ]; then
   WAR="target/${ARTIFACT_ID}.war"
 elif [ -f "target/${ARTIFACT_ID}-${VERSION}.war" ]; then
   WAR="target/${ARTIFACT_ID}-${VERSION}.war"
 else
-  # fallback to first .war found
   WAR="$(ls -1 target/*.war 2>/dev/null | head -n1 || true)"
 fi
-
 [ -n "$WAR" ] && [ -f "$WAR" ] || { echo "Build failed: WAR not found in target/"; exit 1; }
 
 WEBAPPS_DIR="${TOMCAT_HOME:-/var/lib/${TOMCAT_SVC}}/webapps"
 echo ">>> Deploying ${WAR} to ${WEBAPPS_DIR}..."
 sudo cp -f "$WAR" "$WEBAPPS_DIR/"
 
-if command -v journalctl >/dev/null; then
-  echo ">>> Recent Tomcat logs:"
-  sudo journalctl -u "${TOMCAT_SVC}" -n 50 --no-pager || true
+# --- restart & quick health check ---
+echo ">>> Restarting ${TOMCAT_SVC}..."
+if command -v systemctl >/dev/null; then
+  sudo systemctl restart "${TOMCAT_SVC}"
+  sleep 2
+  sudo systemctl --no-pager --full status "${TOMCAT_SVC}" | sed -n '1,15p' || true
 fi
 
-
-# --- start/restart ---
-if command -v systemctl >/dev/null; then
-  echo ">>> Restarting ${TOMCAT_SVC}..."
-  sudo systemctl restart "${TOMCAT_SVC}"
-  sudo systemctl --no-pager --full status "${TOMCAT_SVC}" | sed -n '1,15p' || true
-else
-  echo "systemd not available; start Tomcat manually from ${TOMCAT_HOME}/bin/"
+if command -v curl >/dev/null; then
+  echo ">>> Probing http://localhost:8080/${ARTIFACT_ID}/ ..."
+  curl -fsS "http://localhost:8080/${ARTIFACT_ID}/" >/dev/null && echo "OK" || echo "Probe failed (open 8080 on firewall?)."
 fi
 
 echo "------------------------------------------------------------"
